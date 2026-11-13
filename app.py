@@ -1,9 +1,10 @@
+import json
 import os
 import re
 from datetime import datetime, timezone
 import requests
 from dotenv import load_dotenv
-from flask import Flask, flash, redirect, render_template, request, url_for
+from flask import Flask, flash, jsonify, redirect, render_template, request, url_for
 from flask_sqlalchemy import SQLAlchemy
 
 load_dotenv()
@@ -19,7 +20,6 @@ database_url = os.getenv("DATABASE_URL", default_sqlite)
 if database_url.startswith("sqlite:///./"):
     rel_path = database_url.replace("sqlite:///./", "", 1)
     database_url = f"sqlite:///{os.path.join(BASE_DIR, rel_path)}"
-# Ensure SQLAlchemy uses psycopg v3 for PostgreSQL URLs
 if database_url.startswith("postgres://"):
     database_url = database_url.replace("postgres://", "postgresql+psycopg://", 1)
 elif database_url.startswith("postgresql://"):
@@ -53,6 +53,17 @@ class SmsMessage(db.Model):
         onupdate=lambda: datetime.now(timezone.utc),
     )
 
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "message_id": self.message_id or "-",
+            "recipient": self.recipient,
+            "sender_id": self.sender_id,
+            "message": self.message,
+            "status": self.status,
+            "created_at": self.created_at.strftime("%Y-%m-%d %H:%M"),
+        }
+
 
 with app.app_context():
     db.create_all()
@@ -73,7 +84,6 @@ def parse_and_validate_numbers(raw_numbers: str) -> tuple[list[str], str | None]
 
     valid_numbers = []
     for num in parts:
-        # Strip leading '+' if entered, then enforce international digits-only format (10-15 digits, e.g., 233XXXXXXXXX)
         cleaned = num[1:] if num.startswith("+") else num
         if not re.fullmatch(r"[1-9]\d{9,14}", cleaned):
             return (
@@ -85,11 +95,26 @@ def parse_and_validate_numbers(raw_numbers: str) -> tuple[list[str], str | None]
     return valid_numbers, None
 
 
+def normalize_delivery_status(raw_status: str) -> str:
+    val = str(raw_status or "").strip().upper()
+    if val in {"DELIVRD", "DELIVERED", "SUCCESS", "1701", "0"}:
+        return "DELIVERED"
+    if val in {"UNDELIV", "UNDELIVERED", "FAILED", "REJECTED", "EXPIRED", "ERROR"}:
+        return "UNDELIVERED"
+    return val or "UPDATED"
+
+
 @app.route("/", methods=["GET"])
 def index():
     sender_ids = get_allowed_sender_ids()
     messages = SmsMessage.query.order_by(SmsMessage.created_at.desc()).limit(50).all()
     return render_template("index.html", sender_ids=sender_ids, messages=messages)
+
+
+@app.route("/api/messages", methods=["GET"])
+def list_messages():
+    messages = SmsMessage.query.order_by(SmsMessage.created_at.desc()).limit(50).all()
+    return jsonify([m.to_dict() for m in messages])
 
 
 @app.route("/send", methods=["POST"])
@@ -99,7 +124,6 @@ def send_sms():
     sender_id = request.form.get("sender_id", "").strip()
     message_text = request.form.get("message", "").strip()
 
-    # 1. Validate inputs before touching the API
     if not sender_id or sender_id not in allowed_senders:
         flash("Please select a valid Sender ID from the list.", "error")
         return redirect(url_for("index"))
@@ -130,7 +154,6 @@ def send_sms():
     if callback_url:
         payload["callback_url"] = callback_url
 
-    # 2. Call Nalo SMS API
     try:
         resp = requests.post(NALO_SEND_URL, json=payload, timeout=15)
         raw_body = resp.text
@@ -182,6 +205,69 @@ def send_sms():
         flash(f"Network error contacting Nalo API: {exc}", "error")
 
     return redirect(url_for("index"))
+
+
+@app.route("/api/callback", methods=["GET", "POST"])
+def delivery_callback():
+    payload = {}
+    if request.is_json:
+        payload.update(request.get_json(silent=True) or {})
+    if request.form:
+        payload.update(request.form.to_dict())
+    if request.args:
+        payload.update(request.args.to_dict())
+
+    app.logger.info("Delivery callback received: %s", json.dumps(payload))
+
+    job_id = str(
+        payload.get("job_id")
+        or payload.get("message_id")
+        or payload.get("msg_id")
+        or payload.get("id")
+        or ""
+    ).strip()
+    raw_recipient = str(
+        payload.get("msisdn")
+        or payload.get("recipient")
+        or payload.get("destination")
+        or payload.get("phone")
+        or ""
+    ).strip()
+    recipient = raw_recipient[1:] if raw_recipient.startswith("+") else raw_recipient
+    raw_status = (
+        payload.get("status")
+        or payload.get("dlr_status")
+        or payload.get("delivery_status")
+        or payload.get("state")
+        or ""
+    )
+
+    if not job_id and not recipient:
+        return jsonify({"ok": False, "error": "Missing message_id/job_id or msisdn"}), 400
+
+    query = SmsMessage.query
+    if job_id:
+        query = query.filter_by(message_id=job_id)
+    if recipient:
+        query = query.filter_by(recipient=recipient)
+
+    matches = query.order_by(SmsMessage.created_at.desc()).all()
+    if not matches and recipient:
+        # Fallback: match latest SUBMITTED message for this recipient
+        matches = (
+            SmsMessage.query.filter_by(recipient=recipient, status="SUBMITTED")
+            .order_by(SmsMessage.created_at.desc())
+            .limit(1)
+            .all()
+        )
+
+    new_status = normalize_delivery_status(raw_status)
+    for record in matches:
+        record.status = new_status
+        record.api_response = json.dumps(payload)
+
+    db.session.commit()
+    return jsonify({"ok": True, "updated": len(matches), "status": new_status}), 200
 
 
 @app.route("/delete/<int:msg_db_id>", methods=["POST"])
