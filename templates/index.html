@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Nalo SMS Platform</title>
+  <style>
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      max-width: 1020px;
+      margin: 2rem auto;
+      padding: 0 1rem;
+      background: #f8fafc;
+      color: #0f172a;
+    }
+    .card {
+      background: #ffffff;
+      border: 1px solid #e2e8f0;
+      border-radius: 8px;
+      padding: 1.5rem;
+      margin-bottom: 1.5rem;
+      box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+      overflow-x: auto;
+    }
+    h1, h2 { margin-top: 0; }
+    label {
+      display: block;
+      font-weight: 600;
+      margin-bottom: 0.35rem;
+    }
+    input[type="text"], select, textarea {
+      width: 100%;
+      padding: 0.6rem;
+      border: 1px solid #cbd5e1;
+      border-radius: 6px;
+      font-size: 0.95rem;
+      box-sizing: border-box;
+      margin-bottom: 1rem;
+    }
+    .meta-row {
+      display: flex;
+      justify-content: space-between;
+      font-size: 0.85rem;
+      color: #475569;
+      margin-top: -0.75rem;
+      margin-bottom: 1rem;
+    }
+    button {
+      background: #2563eb;
+      color: #fff;
+      border: none;
+      padding: 0.7rem 1.4rem;
+      font-size: 0.95rem;
+      font-weight: 600;
+      border-radius: 6px;
+      cursor: pointer;
+    }
+    button:hover { background: #1d4ed8; }
+    .btn-clear-all {
+      background: transparent;
+      color: #dc2626;
+      border: 1px solid #fca5a5;
+      padding: 0.35rem 0.75rem;
+      font-size: 0.82rem;
+    }
+    .btn-clear-all:hover {
+      background: #fee2e2;
+    }
+    .btn-delete-row {
+      background: transparent;
+      color: #94a3b8;
+      padding: 0.2rem 0.45rem;
+      font-size: 1rem;
+      line-height: 1;
+    }
+    .btn-delete-row:hover {
+      background: #fee2e2;
+      color: #dc2626;
+    }
+    .history-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 1rem;
+    }
+    .history-header h2 { margin: 0; }
+    .alert {
+      padding: 0.85rem 1rem;
+      border-radius: 6px;
+      margin-bottom: 1rem;
+      word-break: break-word;
+    }
+    .alert-success { background: #dcfce7; color: #166534; border: 1px solid #86efac; }
+    .alert-error { background: #fee2e2; color: #991b1b; border: 1px solid #fca5a5; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.88rem;
+    }
+    th, td {
+      text-align: left;
+      padding: 0.65rem 0.5rem;
+      border-bottom: 1px solid #e2e8f0;
+      vertical-align: middle;
+    }
+    th { background: #f1f5f9; white-space: nowrap; }
+    .msg-id-cell {
+      max-width: 190px;
+      word-break: break-all;
+      font-family: monospace;
+      font-size: 0.8rem;
+      color: #475569;
+    }
+    .badge {
+      display: inline-block;
+      padding: 0.2rem 0.55rem;
+      border-radius: 999px;
+      font-size: 0.76rem;
+      font-weight: 600;
+      background: #e2e8f0;
+      white-space: nowrap;
+    }
+  </style>
+</head>
+<body>
+  <h1>SMS Platform</h1>
+
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+      {% for category, msg in messages %}
+        <div class="alert alert-{{ category }}">{{ msg }}</div>
+      {% endfor %}
+    {% endif %}
+  {% endwith %}
+
+  <div class="card">
+    <h2>Send SMS</h2>
+    <form method="POST" action="{{ url_for('send_sms') }}">
+      <label for="numbers">Recipient Phone Numbers (comma-separated, international format)</label>
+      <input
+        type="text"
+        id="numbers"
+        name="numbers"
+        placeholder="233240000000, 233200000000"
+        required
+      />
+
+      <label for="sender_id">Sender ID</label>
+      <select id="sender_id" name="sender_id" required>
+        {% if not sender_ids %}
+          <option value="">No Sender IDs configured in .env</option>
+        {% else %}
+          <option value="">-- Select Sender ID --</option>
+          {% for sid in sender_ids %}
+            <option value="{{ sid }}">{{ sid }}</option>
+          {% endfor %}
+        {% endif %}
+      </select>
+
+      <label for="message">Message</label>
+      <textarea id="message" name="message" rows="4" placeholder="Type your SMS here..." required></textarea>
+      <div class="meta-row">
+        <span>Standard SMS: 160 chars/segment</span>
+        <span id="char-count">0 characters (0 SMS)</span>
+      </div>
+
+      <button type="submit">Send SMS</button>
+    </form>
+  </div>
+
+  <div class="card">
+    <div class="history-header">
+      <h2>Message History</h2>
+      {% if messages %}
+        <form method="POST" action="{{ url_for('clear_history') }}" onsubmit="return confirm('Clear ALL message history?');" style="margin: 0;">
+          <button type="submit" class="btn-clear-all">Clear All</button>
+        </form>
+      {% endif %}
+    </div>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Time (UTC)</th>
+          <th>Recipient</th>
+          <th>Sender ID</th>
+          <th>Message</th>
+          <th>Message ID</th>
+          <th>Status</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody id="history-body">
+        {% for m in messages %}
+          <tr>
+            <td style="white-space: nowrap;">{{ m.created_at.strftime('%Y-%m-%d %H:%M') }}</td>
+            <td>{{ m.recipient }}</td>
+            <td>{{ m.sender_id }}</td>
+            <td>{{ m.message }}</td>
+            <td class="msg-id-cell">{{ m.message_id or '-' }}</td>
+            <td><span class="badge">{{ m.status }}</span></td>
+            <td style="text-align: right;">
+              <form method="POST" action="{{ url_for('delete_message', msg_db_id=m.id) }}" style="margin: 0;">
+                <button type="submit" class="btn-delete-row" title="Delete">&times;</button>
+              </form>
+            </td>
+          </tr>
+        {% else %}
+          <tr>
+            <td colspan="7">No messages sent yet.</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <script>
+    const msgBox = document.getElementById("message");
+    const charCount = document.getElementById("char-count");
+
+    msgBox.addEventListener("input", () => {
+      const len = msgBox.value.length;
+      const segments = len === 0 ? 0 : Math.ceil(len / 160);
+      charCount.textContent = `${len} character${len === 1 ? "" : "s"} (${segments} SMS)`;
+    });
+  </script>
+</body>
+</html>
