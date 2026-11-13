@@ -1,0 +1,14 @@
+services:
+  app:
+    build: .
+    container_name: nalo-sms-platform
+    ports:
+      - "5000:5000"
+    env_file:
+      - .env
+    volumes:
+      - sms_data:/app/data
+    restart: unless-stopped
+
+volumes:
+  sms_data:
