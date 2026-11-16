@@ -474,6 +474,9 @@ def clear_history():
         db.session.rollback()
         flash(f"Failed to clear history: {exc}", "error")
     return redirect(url_for("index"))
+@app.route("/health", methods=["GET"])
+def health_check():
+    return jsonify({"status": "ok"}), 200
 
 
 if __name__ == "__main__":
