@@ -1,10 +1,21 @@
+import csv
+import io
 import json
 import os
 import re
 from datetime import datetime, timezone
 import requests
 from dotenv import load_dotenv
-from flask import Flask, flash, jsonify, redirect, render_template, request, url_for
+from flask import (
+    Flask,
+    Response,
+    flash,
+    jsonify,
+    redirect,
+    render_template,
+    request,
+    url_for,
+)
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import event
 from sqlalchemy.engine import Engine
@@ -90,25 +101,53 @@ def get_allowed_sender_ids() -> list[str]:
     return [s.strip() for s in raw.split(",") if s.strip()]
 
 
-def parse_and_validate_numbers(raw_numbers: str) -> tuple[list[str], str | None]:
-    if not raw_numbers or not raw_numbers.strip():
-        return [], "Please enter at least one phone number."
+def normalize_phone_number(raw: str) -> str | None:
+    cleaned = re.sub(r"[\s\-\(\)]", "", str(raw or "").strip())
+    if cleaned.startswith("+"):
+        cleaned = cleaned[1:]
+    # Convert local Ghana 10-digit numbers (024XXXXXXX) to 23324XXXXXXX
+    if re.fullmatch(r"0[235]\d{8}", cleaned):
+        cleaned = "233" + cleaned[1:]
+    if re.fullmatch(r"[1-9]\d{9,14}", cleaned):
+        return cleaned
+    return None
 
-    parts = [p.strip() for p in raw_numbers.split(",") if p.strip()]
-    if not parts:
-        return [], "Please enter at least one valid phone number."
 
-    valid_numbers = []
-    for num in parts:
-        cleaned = num[1:] if num.startswith("+") else num
-        if not re.fullmatch(r"[1-9]\d{9,14}", cleaned):
-            return (
-                [],
-                f"Invalid phone number '{num}'. Use international format without '+' (e.g., 233XXXXXXXXX).",
-            )
-        valid_numbers.append(cleaned)
+def parse_recipients(raw_numbers: str, contacts_json: str) -> tuple[list[dict], str | None]:
+    contacts_map: dict[str, dict] = {}
 
-    return valid_numbers, None
+    if contacts_json:
+        try:
+            parsed_contacts = json.loads(contacts_json)
+            if isinstance(parsed_contacts, list):
+                for entry in parsed_contacts:
+                    if not isinstance(entry, dict):
+                        continue
+                    norm = normalize_phone_number(entry.get("phone", ""))
+                    if norm and norm not in contacts_map:
+                        contacts_map[norm] = {
+                            "phone": norm,
+                            "name": str(entry.get("name", "")).strip(),
+                        }
+        except ValueError:
+            pass
+
+    if raw_numbers and raw_numbers.strip():
+        parts = [p.strip() for p in re.split(r"[,;\n]+", raw_numbers) if p.strip()]
+        for num in parts:
+            norm = normalize_phone_number(num)
+            if not norm:
+                return (
+                    [],
+                    f"Invalid phone number '{num}'. Use international format (e.g., 23324XXXXXXX) or 10-digit Ghana format (024XXXXXXX).",
+                )
+            if norm not in contacts_map:
+                contacts_map[norm] = {"phone": norm, "name": ""}
+
+    if not contacts_map:
+        return [], "Please enter at least one valid phone number or upload a contact list."
+
+    return list(contacts_map.values()), None
 
 
 def normalize_delivery_status(raw_status: str) -> str:
@@ -137,35 +176,103 @@ def extract_message_id(data: dict) -> str | None:
     return str(raw_id).strip() if raw_id else None
 
 
+def compute_stats() -> dict:
+    total = SmsMessage.query.count()
+    delivered = SmsMessage.query.filter_by(status="DELIVERED").count()
+    submitted = SmsMessage.query.filter(
+        SmsMessage.status.in_(["SUBMITTED", "PENDING"])
+    ).count()
+    failed = SmsMessage.query.filter(
+        SmsMessage.status.in_(["FAILED", "UNDELIVERED"])
+    ).count()
+    rate = round((delivered / total) * 100, 1) if total > 0 else 0.0
+    return {
+        "total": total,
+        "delivered": delivered,
+        "submitted": submitted,
+        "failed": failed,
+        "delivery_rate": rate,
+    }
+
+
+def dispatch_nalo_sms(
+    api_key: str,
+    recipients: list[str],
+    message_text: str,
+    sender_id: str,
+    callback_url: str,
+) -> tuple[bool, str | None, str]:
+    payload = {
+        "key": api_key,
+        "msisdn": ",".join(recipients),
+        "message": message_text,
+        "sender_id": sender_id,
+        "dlr": "1",
+    }
+    if callback_url:
+        payload["callback_url"] = callback_url
+
+    resp = requests.post(NALO_SEND_URL, json=payload, timeout=15)
+    raw_body = resp.text
+    try:
+        data = resp.json()
+    except ValueError:
+        data = {"raw": raw_body}
+
+    msg_id = extract_message_id(data)
+    accepted = resp.status_code in (200, 201) and str(
+        data.get("status", "")
+    ).lower() not in (
+        "error",
+        "failed",
+        "1702",
+        "1703",
+        "1704",
+        "1705",
+        "1706",
+        "1713",
+    )
+    return accepted, msg_id, raw_body
+
+
 @app.route("/", methods=["GET"])
 def index():
     sender_ids = get_allowed_sender_ids()
-    messages = SmsMessage.query.order_by(SmsMessage.created_at.desc()).limit(50).all()
-    return render_template("index.html", sender_ids=sender_ids, messages=messages)
+    messages = SmsMessage.query.order_by(SmsMessage.created_at.desc()).limit(100).all()
+    stats = compute_stats()
+    return render_template(
+        "index.html", sender_ids=sender_ids, messages=messages, stats=stats
+    )
 
 
 @app.route("/api/messages", methods=["GET"])
 def list_messages():
-    messages = SmsMessage.query.order_by(SmsMessage.created_at.desc()).limit(50).all()
-    return jsonify([m.to_dict() for m in messages])
+    messages = SmsMessage.query.order_by(SmsMessage.created_at.desc()).limit(100).all()
+    return jsonify(
+        {
+            "messages": [m.to_dict() for m in messages],
+            "stats": compute_stats(),
+        }
+    )
 
 
 @app.route("/send", methods=["POST"])
 def send_sms():
     allowed_senders = get_allowed_sender_ids()
     raw_numbers = request.form.get("numbers", "")
+    contacts_json = request.form.get("contacts_json", "")
     sender_id = request.form.get("sender_id", "").strip()
-    message_text = request.form.get("message", "").strip()
+    message_template = request.form.get("message", "").strip()
 
     if not sender_id or sender_id not in allowed_senders:
         flash("Please select a valid Sender ID from the list.", "error")
         return redirect(url_for("index"))
 
-    if not message_text:
+    if not message_template:
         flash("Message body cannot be empty.", "error")
         return redirect(url_for("index"))
 
-    numbers, error = parse_and_validate_numbers(raw_numbers)
+    contacts, error = parse_recipients(raw_numbers, contacts_json)
     if error:
         flash(error, "error")
         return redirect(url_for("index"))
@@ -180,63 +287,78 @@ def send_sms():
     ).strip().rstrip("/")
     callback_url = f"{callback_base}/api/callback" if callback_base else ""
 
-    payload = {
-        "key": api_key,
-        "msisdn": ",".join(numbers),
-        "message": message_text,
-        "sender_id": sender_id,
-        "dlr": "1",
-    }
-    if callback_url:
-        payload["callback_url"] = callback_url
+    uses_personalization = "{name}" in message_template
 
     try:
-        resp = requests.post(NALO_SEND_URL, json=payload, timeout=15)
-        raw_body = resp.text
-        try:
-            data = resp.json()
-        except ValueError:
-            data = {"raw": raw_body}
+        accepted_count = 0
+        failed_count = 0
+        last_raw = ""
 
-        msg_id = extract_message_id(data)
-
-        accepted = resp.status_code in (200, 201) and str(
-            data.get("status", "")
-        ).lower() not in (
-            "error",
-            "failed",
-            "1702",
-            "1703",
-            "1704",
-            "1705",
-            "1706",
-            "1713",
-        )
-        initial_status = "SUBMITTED" if accepted else "FAILED"
-
-        for num in numbers:
-            record = SmsMessage(
-                message_id=msg_id,
-                recipient=num,
-                sender_id=sender_id,
-                message=message_text,
-                status=initial_status,
-                api_response=raw_body,
+        if uses_personalization:
+            for contact in contacts:
+                display_name = contact["name"] or "Customer"
+                personalized_msg = message_template.replace("{name}", display_name)
+                accepted, msg_id, raw_body = dispatch_nalo_sms(
+                    api_key, [contact["phone"]], personalized_msg, sender_id, callback_url
+                )
+                last_raw = raw_body
+                if accepted:
+                    accepted_count += 1
+                else:
+                    failed_count += 1
+                db.session.add(
+                    SmsMessage(
+                        message_id=msg_id,
+                        recipient=contact["phone"],
+                        sender_id=sender_id,
+                        message=personalized_msg,
+                        status="SUBMITTED" if accepted else "FAILED",
+                        api_response=raw_body,
+                    )
+                )
+        else:
+            phone_list = [c["phone"] for c in contacts]
+            accepted, msg_id, raw_body = dispatch_nalo_sms(
+                api_key, phone_list, message_template, sender_id, callback_url
             )
-            db.session.add(record)
+            last_raw = raw_body
+            if accepted:
+                accepted_count = len(phone_list)
+            else:
+                failed_count = len(phone_list)
+
+            for phone in phone_list:
+                db.session.add(
+                    SmsMessage(
+                        message_id=msg_id,
+                        recipient=phone,
+                        sender_id=sender_id,
+                        message=message_template,
+                        status="SUBMITTED" if accepted else "FAILED",
+                        api_response=raw_body,
+                    )
+                )
+
         db.session.commit()
 
-        if accepted:
-            id_info = f" (Message ID: {msg_id})" if msg_id else ""
-            flash(f"SMS accepted by Nalo API{id_info}. Response: {raw_body}", "success")
+        if accepted_count > 0 and failed_count == 0:
+            flash(
+                f"Successfully submitted {accepted_count} SMS message(s) to Nalo.",
+                "success",
+            )
+        elif accepted_count > 0:
+            flash(
+                f"Submitted {accepted_count} message(s), {failed_count} failed. Last response: {last_raw}",
+                "error",
+            )
         else:
-            flash(f"Nalo API rejected the request: {raw_body}", "error")
+            flash(f"Nalo API rejected the request: {last_raw}", "error")
 
     except requests.RequestException as exc:
         flash(f"Network error contacting Nalo API: {exc}", "error")
     except Exception as exc:
         db.session.rollback()
-        app.logger.exception("Error saving SMS record")
+        app.logger.exception("Error processing SMS request")
         flash(f"Error processing SMS request: {exc}", "error")
 
     return redirect(url_for("index"))
@@ -302,6 +424,34 @@ def delivery_callback():
 
     db.session.commit()
     return jsonify({"ok": True, "updated": len(matches), "status": new_status}), 200
+
+
+@app.route("/export/csv", methods=["GET"])
+def export_csv():
+    messages = SmsMessage.query.order_by(SmsMessage.created_at.desc()).all()
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(
+        ["ID", "Time (UTC)", "Recipient", "Sender ID", "Message", "Message ID", "Status"]
+    )
+    for m in messages:
+        writer.writerow(
+            [
+                m.id,
+                m.created_at.strftime("%Y-%m-%d %H:%M:%S"),
+                m.recipient,
+                m.sender_id,
+                m.message,
+                m.message_id or "-",
+                m.status,
+            ]
+        )
+
+    return Response(
+        output.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": "attachment; filename=nalo_sms_report.csv"},
+    )
 
 
 @app.route("/delete/<int:msg_db_id>", methods=["POST"])
