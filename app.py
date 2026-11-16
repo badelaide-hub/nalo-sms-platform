@@ -42,6 +42,12 @@ app.config["SQLALCHEMY_DATABASE_URI"] = database_url
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 if database_url.startswith("sqlite"):
     app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {"connect_args": {"timeout": 30}}
+else:
+    # Prevents dropped-connection errors on Render PostgreSQL
+    app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
+        "pool_pre_ping": True,
+        "pool_recycle": 300,
+    }
 
 db = SQLAlchemy(app)
 
@@ -474,6 +480,8 @@ def clear_history():
         db.session.rollback()
         flash(f"Failed to clear history: {exc}", "error")
     return redirect(url_for("index"))
+
+
 @app.route("/health", methods=["GET"])
 def health_check():
     return jsonify({"status": "ok"}), 200
