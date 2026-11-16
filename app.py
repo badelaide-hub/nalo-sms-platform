@@ -6,6 +6,8 @@ import requests
 from dotenv import load_dotenv
 from flask import Flask, flash, jsonify, redirect, render_template, request, url_for
 from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import event
+from sqlalchemy.engine import Engine
 
 load_dotenv()
 
@@ -16,7 +18,7 @@ DATA_DIR = os.path.join(BASE_DIR, "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
 default_sqlite = f"sqlite:///{os.path.join(DATA_DIR, 'sms_platform.db')}"
-database_url = os.getenv("DATABASE_URL", default_sqlite)
+database_url = os.getenv("DATABASE_URL", default_sqlite).strip()
 if database_url.startswith("sqlite:///./"):
     rel_path = database_url.replace("sqlite:///./", "", 1)
     database_url = f"sqlite:///{os.path.join(BASE_DIR, rel_path)}"
@@ -27,10 +29,21 @@ elif database_url.startswith("postgresql://"):
 
 app.config["SQLALCHEMY_DATABASE_URI"] = database_url
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+if database_url.startswith("sqlite"):
+    app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {"connect_args": {"timeout": 30}}
 
 db = SQLAlchemy(app)
 
 NALO_SEND_URL = "https://sms.nalosolutions.com/smsbackend/Resl_Nalo/send-message/"
+
+
+@event.listens_for(Engine, "connect")
+def set_sqlite_pragma(dbapi_connection, connection_record):
+    if database_url.startswith("sqlite"):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL;")
+        cursor.execute("PRAGMA synchronous=NORMAL;")
+        cursor.close()
 
 
 class SmsMessage(db.Model):
@@ -66,7 +79,10 @@ class SmsMessage(db.Model):
 
 
 with app.app_context():
-    db.create_all()
+    try:
+        db.create_all()
+    except Exception as exc:
+        app.logger.warning("Database initialization notice: %s", exc)
 
 
 def get_allowed_sender_ids() -> list[str]:
@@ -102,6 +118,23 @@ def normalize_delivery_status(raw_status: str) -> str:
     if val in {"UNDELIV", "UNDELIVERED", "FAILED", "REJECTED", "EXPIRED", "ERROR"}:
         return "UNDELIVERED"
     return val or "UPDATED"
+
+
+def extract_message_id(data: dict) -> str | None:
+    if not isinstance(data, dict):
+        return None
+    nested = data.get("data") if isinstance(data.get("data"), dict) else {}
+    raw_id = (
+        data.get("job_id")
+        or data.get("message_id")
+        or data.get("msg_id")
+        or data.get("id")
+        or nested.get("job_id")
+        or nested.get("message_id")
+        or nested.get("msg_id")
+        or nested.get("id")
+    )
+    return str(raw_id).strip() if raw_id else None
 
 
 @app.route("/", methods=["GET"])
@@ -142,7 +175,9 @@ def send_sms():
         flash("Server configuration error: SMS_API_KEY is not set.", "error")
         return redirect(url_for("index"))
 
-    callback_base = os.getenv("CALLBACK_BASE_URL", "").rstrip("/")
+    callback_base = os.getenv(
+        "CALLBACK_BASE_URL", "https://nalo-sms-platform.onrender.com"
+    ).strip().rstrip("/")
     callback_url = f"{callback_base}/api/callback" if callback_base else ""
 
     payload = {
@@ -150,6 +185,7 @@ def send_sms():
         "msisdn": ",".join(numbers),
         "message": message_text,
         "sender_id": sender_id,
+        "dlr": "1",
     }
     if callback_url:
         payload["callback_url"] = callback_url
@@ -162,16 +198,11 @@ def send_sms():
         except ValueError:
             data = {"raw": raw_body}
 
-        msg_id = None
-        if isinstance(data, dict):
-            msg_id = (
-                data.get("message_id")
-                or data.get("job_id")
-                or data.get("id")
-                or (data.get("data", {}) if isinstance(data.get("data"), dict) else {}).get("message_id")
-            )
+        msg_id = extract_message_id(data)
 
-        accepted = resp.status_code in (200, 201) and str(data.get("status", "")).lower() not in (
+        accepted = resp.status_code in (200, 201) and str(
+            data.get("status", "")
+        ).lower() not in (
             "error",
             "failed",
             "1702",
@@ -185,7 +216,7 @@ def send_sms():
 
         for num in numbers:
             record = SmsMessage(
-                message_id=str(msg_id) if msg_id else None,
+                message_id=msg_id,
                 recipient=num,
                 sender_id=sender_id,
                 message=message_text,
@@ -203,6 +234,10 @@ def send_sms():
 
     except requests.RequestException as exc:
         flash(f"Network error contacting Nalo API: {exc}", "error")
+    except Exception as exc:
+        db.session.rollback()
+        app.logger.exception("Error saving SMS record")
+        flash(f"Error processing SMS request: {exc}", "error")
 
     return redirect(url_for("index"))
 
@@ -253,7 +288,6 @@ def delivery_callback():
 
     matches = query.order_by(SmsMessage.created_at.desc()).all()
     if not matches and recipient:
-        # Fallback: match latest SUBMITTED message for this recipient
         matches = (
             SmsMessage.query.filter_by(recipient=recipient, status="SUBMITTED")
             .order_by(SmsMessage.created_at.desc())
