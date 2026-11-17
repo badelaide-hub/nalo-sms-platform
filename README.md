@@ -2,17 +2,18 @@
 
 A Python/Flask web application integrated with the **Nalo Solutions SMS API** for sending single and bulk SMS messages, tracking real-time delivery reports via webhooks, and exporting persistent message logs to CSV.
 
-* **Live Application:** https://nalo-sms-platform.onrender.com/
-* **Source Repository:** https://github.com/badelaide-hub/nalo-sms-platform
+- **Live Application:** https://nalo-sms-platform.onrender.com/
+- **Health Check:** https://nalo-sms-platform.onrender.com/health
+- **Source Repository:** https://github.com/badelaide-hub/nalo-sms-platform
 
 ---
 
 ## What the App Does
 
-* **SMS Dispatch:** Sends single or bulk SMS messages with custom Sender IDs through the Nalo Solutions API.
-* **Real-Time Delivery Callbacks:** Exposes a webhook endpoint (`/callback`) that listens for Nalo Delivery Reports (DLR) and automatically updates message statuses in the database (`SUBMITTED` → `DELIVERED`, `UNDELIVERABLE`, `EXPIRED`, etc.).
-* **Persistent Message History:** Uses **PostgreSQL** (`DATABASE_URL`) so message records and delivery statuses remain intact across page refreshes, server restarts, and Render redeployments.
-* **CSV Report Export:** Generates and downloads full SMS activity reports—including UTC timestamps, recipient numbers, Sender IDs, message IDs, and delivery statuses—as a `.csv` file.
+- **SMS Dispatch:** Sends single or bulk SMS messages (with optional `{name}` personalization) using approved Sender IDs through the Nalo Solutions API.
+- **Real-Time Delivery Callbacks:** Exposes a webhook endpoint (`/api/callback`) that accepts both `GET` and `POST` Nalo Delivery Reports (DLR) and automatically updates message statuses in the database (`SUBMITTED` → `DELIVERED`, `UNDELIVERABLE`, `EXPIRED`, etc.).
+- **Persistent Message History:** Uses **PostgreSQL** (`DATABASE_URL`) in production (with SQLite fallback locally) so message records and delivery statuses remain intact across page refreshes, server restarts, and Render redeployments.
+- **CSV Report Export:** Generates and downloads full SMS activity reports—including UTC timestamps, recipient numbers, Sender IDs, message IDs, and delivery statuses—as `nalo_sms_report.csv`.
 
 ---
 
@@ -22,16 +23,11 @@ Create a `.env` file in the root directory of the project (ensure `.env` is in y
 
 | Variable | Required | Description | Example |
 | :--- | :---: | :--- | :--- |
-| `NALO_API_KEY` | Yes* | Your Nalo Solutions API authentication key (used instead of username/password). | `your_nalo_api_key` |
-| `NALO_USERNAME` | Yes* | Your Nalo account username (required if not using `NALO_API_KEY`). | `adelaidebaah` |
-| `NALO_PASSWORD` | Yes* | Your Nalo account password (required if not using `NALO_API_KEY`). | `your_password` |
-| `NALO_SENDER_ID` | Yes | Approved alphanumeric Sender ID (max 11 characters) shown on recipient devices. | `ADELLE` |
-| `CALLBACK_URL` | Yes | Public HTTPS URL where Nalo sends delivery report callbacks. | `https://nalo-sms-platform.onrender.com/callback` |
-| `DATABASE_URL` | Yes | PostgreSQL connection string (`postgresql://...`) for persistent message storage. | `your_database_url` |
-| `SECRET_KEY` | Yes | Flask secret key used for session signing and CSRF protection. | `your_secret_key` |
-| `PORT` | No | Port the web server binds to (defaults to `5000` locally; set automatically by Render). | `5000` |
-
-*\*Provide either `NALO_API_KEY` or the `NALO_USERNAME` + `NALO_PASSWORD` pair.*
+| `SMS_API_KEY` | Yes | Your Nalo Solutions API authentication key. | `your_nalo_api_key` |
+| `SENDER_IDS` | Yes | Comma-separated list of approved alphanumeric Sender IDs (max 11 characters). | `ADELLE` |
+| `CALLBACK_BASE_URL` | Yes | Public HTTPS base URL where Nalo sends delivery report callbacks (the app appends `/api/callback` automatically). | `https://nalo-sms-platform.onrender.com` |
+| `DATABASE_URL` | Yes | PostgreSQL connection string (`postgresql://...`) for persistent message storage (defaults to local SQLite if omitted). | `your_database_url` |
+| `FLASK_SECRET_KEY` | Yes | Flask secret key used for session signing and flash messages. | `your_secret_key` |
 
 ---
 
